@@ -92,6 +92,37 @@ def first_token_from_logprobs(resp: dict, is_chat: bool) -> int:
     )
 
 
+def _clip_at_stop(acc: str, chunk: str, stops: list) -> tuple:
+    """Split ``chunk`` at the first stop sequence, accounting for chunk boundaries.
+
+    ``acc`` is the text already emitted, so a stop sequence straddling two chunks
+    is still found. Returns ``(text_to_emit, hit)``; the stop sequence itself is
+    excluded from the output, as the OpenAI API specifies.
+    """
+    combined = acc + chunk
+    start = max(0, len(acc) - max(len(x) for x in stops) + 1)
+    cut = None
+    for stop in stops:
+        idx = combined.find(stop, start)
+        if idx != -1 and (cut is None or idx < cut):
+            cut = idx
+    if cut is None:
+        return chunk, False
+    return combined[len(acc) : max(cut, len(acc))], True
+
+
+def _truncate_at_stop(text: str, stops: list) -> tuple:
+    """Non-streaming counterpart of :func:`_clip_at_stop`."""
+    cut = None
+    for stop in stops:
+        idx = text.find(stop)
+        if idx != -1 and (cut is None or idx < cut):
+            cut = idx
+    if cut is None:
+        return text, False
+    return text[:cut], True
+
+
 def _thinking_enabled(body: dict) -> bool:
     ctk = body.get("chat_template_kwargs") or {}
     return bool(ctk.get("enable_thinking", True))
@@ -172,6 +203,14 @@ def build_app(ctx: RouterCtx) -> FastAPI:
     def _sampling_of(body):
         return {k: body[k] for k in ("temperature", "top_p", "top_k", "ignore_eos") if k in body}
 
+    def _stops_of(body):
+        raw = body.get("stop")
+        if raw is None:
+            return []
+        if isinstance(raw, str):
+            raw = [raw]
+        return [x for x in raw if isinstance(x, str) and x][:4]
+
     def _max_tokens_of(body):
         return int(body.get("max_tokens") or body.get("max_completion_tokens") or 256)
 
@@ -208,8 +247,13 @@ def build_app(ctx: RouterCtx) -> FastAPI:
 
             choice: dict = {"index": 0, "finish_reason": finish}
             parser = ctx.parser(_thinking_enabled(body)) if is_chat else None
+            stops = _stops_of(body)
             if parser is not None:
                 text = ctx.tokenizer.decode(token_ids, skip_special_tokens=False)
+                if stops:
+                    text, hit = _truncate_at_stop(text, stops)
+                    if hit:
+                        choice["finish_reason"] = "stop"
                 parsed = parser.parse_complete(text)
                 msg = {"role": "assistant", "content": parsed.content or ""}
                 if parsed.reasoning_content:
@@ -224,6 +268,10 @@ def build_app(ctx: RouterCtx) -> FastAPI:
                     if ctx.tokenizer
                     else None
                 )
+                if stops and text:
+                    text, hit = _truncate_at_stop(text, stops)
+                    if hit:
+                        choice["finish_reason"] = "stop"
                 if is_chat:
                     choice["message"] = {"role": "assistant", "content": text}
                 else:
@@ -274,6 +322,7 @@ def build_app(ctx: RouterCtx) -> FastAPI:
         model = prefill.get("model")
         prompt_tokens = (prefill.get("usage") or {}).get("prompt_tokens")
         parser = ctx.parser(_thinking_enabled(body))
+        stops = _stops_of(body)
 
         def _chunk(delta: dict, finish=None, usage=None) -> str:
             payload = {
@@ -327,6 +376,7 @@ def build_app(ctx: RouterCtx) -> FastAPI:
             from tilert.pd_vllm.oai_parser import IncrementalDetok
 
             n_tokens = 0
+            acc = ""
             saw_tool = False
             finish_reason = "stop"
             client_gone = False
@@ -364,13 +414,21 @@ def build_app(ctx: RouterCtx) -> FastAPI:
                             text = detok.push(msg["t"])
                             if not text:
                                 continue
-                            if sess is None:
-                                yield _chunk({"content": text})
-                                continue
-                            for ev in sess.feed(text):
-                                if ev["kind"] == "tool":
-                                    saw_tool = True
-                                yield _chunk(_event_delta(ev))
+                            hit = False
+                            if stops:
+                                text, hit = _clip_at_stop(acc, text, stops)
+                                acc += text
+                            if text:
+                                if sess is None:
+                                    yield _chunk({"content": text})
+                                else:
+                                    for ev in sess.feed(text):
+                                        if ev["kind"] == "tool":
+                                            saw_tool = True
+                                        yield _chunk(_event_delta(ev))
+                            if hit:
+                                finish_reason = "stop"
+                                break
                         elif "done" in msg:
                             finish_reason = msg.get("finish_reason", "stop")
                             if finish_reason == "cancelled":
